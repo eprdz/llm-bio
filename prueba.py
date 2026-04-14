@@ -1,13 +1,18 @@
-from llm import GenomicClinicalAgentLocal
-agent = GenomicClinicalAgentLocal()
+from llm import GenomicVectorMockAgent
+agent = GenomicVectorMockAgent()
+
+print("\n" + "="*50)
+print("Sequencing AI (Vector Search with Mock DB)")
+print("="*50)
 
 while True:
-    print("\n" + "-"*50)
-    variant = input("Introduce RSID (ej. rs1042522) or 'exit': ")
-    if variant.lower() == 'exit':
+    # You no longer need to ask for the RSID specifically!
+    user_input = input("\nYou (or type 'exit'): ")
+    
+    if user_input.lower() in ['exit', 'quit']:
         break
-
-    quest = input("¿What dp ypu want to know?: ")
-
-    report = agent.generate_report(quest, variant)
-    print(f"\nCLINICAL REPORT:\n{report}")
+    if not user_input.strip():
+        continue
+        
+    report = agent.chat(user_input)
+    print(f"\nRAG Report:\n{report}")
