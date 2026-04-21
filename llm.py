@@ -1,40 +1,29 @@
 import ollama
 import chromadb
-import json
 import os
 import gzip
 import re
-
 
 class GenomicVectorMockAgent:
     def __init__(self):
         self.llm_model = "phi3"
         self.embed_model = "nomic-embed-text"
-        self.clinical_database = self.load_db()
 
-        self.chroma_client = chromadb.Client()
-        self.collection = self.chroma_client.create_collection(name="mock_clinical_variants")
+        self.chroma_client = chromadb.PersistentClient(path="./clinvar_chroma_db")
+        self.collection = self.chroma_client.get_or_create_collection(name="clinical_variants")
         
-        self._vectorize_database()
-
-    def load_db(self, json_file="db.json", clinvar_file="clinvar.vcf.gz"):
-        """Loads the database. If it does not exist, it creates it and then loads it."""
-        if os.path.exists(json_file):
-            with open(json_file, "r") as f:
-                print(f"{json_file} found")
-                json_ = json.load(f)
-
-            return json_
+        count = self.collection.count()
+        if count == 0:
+            print("Base de datos vectorial vacia. Leyendo VCF y generando vectores (esto puede tardar la primera vez)...")
+            self._load_and_vectorize("clinvar.vcf.gz")
         else:
-            print(f"{clinvar_file} found and no json file. Generating database...")
-            self.parse_clinvar(clinvar_file)
-    
+            print(f"Base de datos cargada desde disco instantaneamente. {count} variantes disponibles.")
 
     def parse_clinvar(self, clinvar_file="clinvar.vcf.gz"):
+        """Lee el VCF y extrae los campos. Ya no guarda un JSON."""
         dict_ = {}
         print(f"Parsing {clinvar_file}...")
         
-        # Open the gzip file safely in text mode with utf-8
         with gzip.open(clinvar_file, "rt", encoding="utf-8") as f:
             for line in f:
                 if line.startswith('#'):
@@ -66,62 +55,60 @@ class GenomicVectorMockAgent:
                     "type_of_variation": mc.split('|')[0] if mc else "",
                     "rsid": f"rs{rs}" if rs else ""
                 }
-
-        with open("db.json", "w") as f:
-            json.dump(dict_, f)
                 
-        print(f"Successfully loaded {len(dict_)} variants into memory.")
         return dict_
 
-
-    def _get_embedding(self, text: str):
-        """Generates the mathematical vector for a given text using Ollama."""
-        response = ollama.embeddings(model=self.embed_model, prompt=text)
+    def _get_embedding(self, text: str, is_query: bool = False):
+        """Usa prefijos de Nomic para optimizar la busqueda y generar el vector."""
+        prefix = "search_query: " if is_query else "search_document: "
+        response = ollama.embeddings(model=self.embed_model, prompt=prefix + text)
         return response["embedding"]
 
-    def _vectorize_database(self):
-        """Converts the dictionary into vectors and stores them in ChromaDB."""
+    def _load_and_vectorize(self, clinvar_file):
+        """Unifica el parseo y la vectorizacion, insertando en lotes (batches)."""
+        temp_database = self.parse_clinvar(clinvar_file)
         
         documents = []
         metadatas = []
         ids = []
         embeddings = []
         
-        for clinvar_id, data in self.clinical_database.items():
-            # Create a rich text paragraph for the vector model to understand
+        print("Vectorizando datos e insertando en disco...")
+        for clinvar_id, data in temp_database.items():
             text_to_embed = f"The variant {clinvar_id} in the gene {data['gene']} is associated with the condition {data['condition']}. Type of variation: {data['type_of_variation']}. Rsid: {data['rsid']} Clinical classification: {data['significance']}. HGVS: {data['HGVS']}"
             
             documents.append(text_to_embed)
             metadatas.append({"clinvar_id": clinvar_id, "gene": data['gene']})
             ids.append(clinvar_id)
+            embeddings.append(self._get_embedding(text_to_embed, is_query=False))
             
-            # Call the embedding model
-            embeddings.append(self._get_embedding(text_to_embed))
+            # Insertar en bloques de 5000 para no saturar la memoria RAM
+            if len(documents) >= 5000:
+                self.collection.add(documents=documents, embeddings=embeddings, metadatas=metadatas, ids=ids)
+                documents, metadatas, ids, embeddings = [], [], [], []
 
-        # Add to the vector database
-        self.collection.add(
-            documents=documents,
-            embeddings=embeddings,
-            metadatas=metadatas,
-            ids=ids
-        )
-        print(f"Successfully indexed {len(documents)} variants in the Vector Space!")
+        # Insertar el remanente
+        if documents:
+            self.collection.add(documents=documents, embeddings=embeddings, metadatas=metadatas, ids=ids)
+            
+        print(f"Indexacion completada. {self.collection.count()} variantes almacenadas en disco de forma permanente.")
 
     def _vector_search(self, query: str) -> str:
-        """Finds the most relevant data based on the meaning of the question."""
-        query_vector = self._get_embedding(query)
+        """Busca el vector en el disco."""
+        query_vector = self._get_embedding(query, is_query=True)
         
         results = self.collection.query(
             query_embeddings=[query_vector],
-            n_results=30 # Study THIS
+            n_results=5 # Recuperamos 5 contextos (30 es demasiado para el contexto de phi3)
         )
         
         if results['documents'] and len(results['documents'][0]) > 0:
-            return results['documents'][0][0]
+            print("\n---\n".join(results['documents'][0]))
+            return "\n---\n".join(results['documents'][0])
         return None
 
     def chat(self, user_query: str) -> str:
-        """Orchestrates the RAG process."""
+        """Orquesta el RAG."""
         context = self._vector_search(user_query)
         
         system_prompt = """
@@ -139,7 +126,6 @@ class GenomicVectorMockAgent:
 
         print("\nProcessing the report...")
         
-        # Step 3: Let the LLM read the context and write the answer
         try:
             response = ollama.chat(
                 model=self.llm_model,
