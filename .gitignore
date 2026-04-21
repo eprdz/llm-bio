@@ -1,1 +1,4 @@
 __pycache__/
+clinvar.vcf.gz
+db.json
+.vscode
