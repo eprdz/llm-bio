@@ -130,24 +130,64 @@ class GenomicVectorMockAgent:
         print(f"\nParallel indexing completed. {self.collection.count()} variants stored.")
 
     def exact_metadata_search(self, filter_dict: dict) -> str:
-        results = self.collection.get(where=filter_dict)
-        amount = len(results['ids'])
+        """Performs an exact search using pagination to bypass SQLite limitations."""
+        
+        chunk_size = 2000 # Safe limit for a single SQLite query
+        offset = 0
+        all_ids = []
+        all_docs = []
+        
+        # The maximum number of variants to pull into RAM. 
+        # You can safely increase this to 50000 or 100000 if your RAM allows it.
+        MAX_SAFE_LIMIT = 20000 
+        
+        while True:
+            try:
+                # Fetch a safe chunk of variants
+                chunk = self.collection.get(
+                    where=filter_dict,
+                    limit=chunk_size,
+                    offset=offset,
+                    include=["documents"] # We only fetch text to save memory, not the embeddings
+                )
+                
+                if not chunk['ids']:
+                    break # No more results found
+                    
+                all_ids.extend(chunk['ids'])
+                all_docs.extend(chunk['documents'])
+                offset += chunk_size
+                
+                # Safety circuit breaker to prevent infinite loops or OOM (Out Of Memory)
+                if len(all_ids) >= MAX_SAFE_LIMIT:
+                    break
+                    
+            except Exception as e:
+                print(f"Pagination error: {e}")
+                break
+                
+        amount = len(all_ids)
         
         if amount == 0:
             return f"I have not found any variant that matches the provided filters."
-        
-        report = f"I found {amount} variants with those criteria:\n"
+            
+        # Formatting the report
+        max_indicator = f"{MAX_SAFE_LIMIT}+" if amount >= MAX_SAFE_LIMIT else str(amount)
+        report = f"I retrieved {max_indicator} variants from the database:\n"
         report += "-" * 60 + "\n"
         
-        limit = min(amount, 10) 
-        for i in range(limit):
-            var_id = results['ids'][i]
-            doc_text = results['documents'][i] 
+        # We limit the terminal PRINTING to 20 so your screen doesn't get flooded,
+        # but the system successfully pulled thousands into the 'all_ids' list.
+        visual_limit = min(amount, 20) 
+        for i in range(visual_limit):
+            var_id = all_ids[i]
+            doc_text = all_docs[i] 
             clean_text = doc_text.replace("search_document: ", "").split("Clinical classification:")[0].strip()
             report += f"[{i+1}] Variant: {var_id} -> {clean_text}\n"
             
-        if amount > 10:
-            report += f"... and {amount - 10} more variants hidden to save space.\n"
+        if amount > 20:
+            report += f"... and {amount - 20} more variants hidden to save terminal space.\n"
+            report += f"(System successfully loaded {max_indicator} items into memory).\n"
             
         return report
 
